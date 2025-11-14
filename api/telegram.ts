@@ -2,32 +2,23 @@ import { Telegraf } from 'telegraf';
 import { createClient } from '@supabase/supabase-js';
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  console.log('=== Webhook received ===');
-  console.log('Method:', req.method);
-  console.log('Body:', JSON.stringify(req.body));
-  
-  if (req.method !== 'POST') {
-    return res.status(200).json({ status: 'ok' });
-  }
+// Создаем бота один раз для переиспользования
+let bot: Telegraf | null = null;
+let supabase: any = null;
 
-  try {
-    // Получаем переменные окружения
-    const token = process.env.TELEGRAM_BOT_TOKEN;
-    const supabaseUrl = process.env.SUPABASE_URL;
-    const supabaseKey = process.env.SUPABASE_KEY;
-    
-    if (!token || !supabaseUrl || !supabaseKey) {
-      throw new Error('Missing environment variables');
-    }
-    
-    console.log('Environment variables loaded');
-    
-    // Создаем бота
-    const bot = new Telegraf(token);
-    
-    // Создаем клиент Supabase
-    const supabase = createClient(supabaseUrl, supabaseKey);
+function initBot() {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const supabaseKey = process.env.SUPABASE_KEY;
+  
+  if (!token || !supabaseUrl || !supabaseKey) {
+    throw new Error('Missing environment variables');
+  }
+  
+  // Создаем бота только если его еще нет
+  if (!bot) {
+    bot = new Telegraf(token);
+    supabase = createClient(supabaseUrl, supabaseKey);
     
     // Обработчик команды /start
     bot.start(async (ctx) => {
@@ -143,16 +134,53 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       await ctx.reply(`Вы написали: ${text}`);
     });
     
-    // Обрабатываем update
-    await bot.handleUpdate(req.body as any);
+    console.log('Bot initialized successfully');
+  }
+  
+  return { bot, supabase };
+}
+
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  console.log('=== Webhook received ===');
+  console.log('Method:', req.method);
+  console.log('Headers:', JSON.stringify(req.headers));
+  console.log('Body type:', typeof req.body);
+  
+  // Важно: Telegram всегда отправляет POST запросы
+  if (req.method !== 'POST') {
+    console.log('Not a POST request, returning 200');
+    return res.status(200).json({ ok: true });
+  }
+
+  try {
+    // Инициализируем бота
+    const { bot: telegramBot } = initBot();
+    
+    if (!telegramBot) {
+      throw new Error('Failed to initialize bot');
+    }
+    
+    // Проверяем что body существует
+    if (!req.body || typeof req.body !== 'object') {
+      console.error('Invalid body:', req.body);
+      return res.status(200).json({ ok: true });
+    }
+    
+    console.log('Processing update:', JSON.stringify(req.body));
+    
+    // Обрабатываем update от Telegram
+    await telegramBot.handleUpdate(req.body);
     
     console.log('Update processed successfully');
+    
+    // ВАЖНО: Всегда возвращаем 200 для Telegram
     return res.status(200).json({ ok: true });
     
   } catch (error: any) {
-    console.error('Error:', error.message);
+    console.error('Error processing update:', error.message);
     console.error('Stack:', error.stack);
-    // Всегда возвращаем 200 для Telegram
+    
+    // ВАЖНО: Даже при ошибке возвращаем 200, чтобы Telegram не помечал webhook как неработающий
     return res.status(200).json({ ok: true });
   }
 }
