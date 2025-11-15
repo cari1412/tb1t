@@ -5,13 +5,12 @@ import { TelegramModule } from './telegram/telegram.module';
 import { DatabaseModule } from './database/database.module';
 import supabaseConfig from './config/supabase.config';
 import telegramConfig from './config/telegram.config';
-import databaseConfig from './config/database.config'; // ДОБАВИТЬ
 
 @Module({
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
-      load: [supabaseConfig, telegramConfig, databaseConfig], // ДОБАВИТЬ databaseConfig
+      load: [supabaseConfig, telegramConfig],
       envFilePath: ['.env.local', '.env'],
     }),
     TelegrafModule.forRootAsync({
