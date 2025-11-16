@@ -23,12 +23,12 @@ export default async function handler(req: any, res: any) {
 
     // Извлекаем реальный IP
     const realIP = geoService.extractRealIP(req.headers);
-    const isRussian = geoService.isRussianIP(realIP);
+    const isCanadian = geoService.isRussianIP(realIP); // переименовал для ясности
 
-    console.log(`📍 IP: ${realIP}, Russian: ${isRussian}`);
+    console.log(`📍 IP: ${realIP}, Canadian: ${isCanadian}`);
 
-    // Если траффик из России - проксируем на VPS
-    if (isRussian) {
+    // 🇨🇦 Если траффик из Канады - проксируем на VPS (ДЛЯ ТЕСТА)
+    if (isCanadian) {
       const VPS_URL = process.env.VPS_WEBHOOK_URL;
       
       if (!VPS_URL) {
