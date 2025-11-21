@@ -2,10 +2,13 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Context } from 'telegraf';
 import { StartCommand } from './commands/start.command';
 import { HelpCommand } from './commands/help.command';
+import { SubscriptionCommand } from './commands/subscription.command';
 import { DatabaseService } from '../database/database.service';
 import { TelegramService } from './telegram.service';
 import { GeminiService } from '../ai/gemini.service';
+import { SubscriptionService } from './subscription.service';
 import { hasFrom, hasTextMessage } from './guards/context.guard';
+import { PaymentCallbackData } from '../types/payment.types';
 
 @Injectable()
 export class TelegramUpdate implements OnModuleInit {
@@ -14,14 +17,17 @@ export class TelegramUpdate implements OnModuleInit {
   constructor(
     private startCommand: StartCommand,
     private helpCommand: HelpCommand,
+    private subscriptionCommand: SubscriptionCommand,
     private databaseService: DatabaseService,
     private telegramService: TelegramService,
     private geminiService: GeminiService,
+    private subscriptionService: SubscriptionService,
   ) {}
 
   onModuleInit() {
     const bot = this.telegramService.getBot();
 
+    // Основные команды
     bot.start(async (ctx: Context) => {
       try {
         await this.onStart(ctx);
@@ -46,6 +52,50 @@ export class TelegramUpdate implements OnModuleInit {
       }
     });
 
+    // Команды для подписок
+    bot.command('subscribe', async (ctx: Context) => {
+      try {
+        await this.subscriptionCommand.showPlans(ctx);
+      } catch (error: any) {
+        this.logger.error(`Error in /subscribe: ${error.message}`);
+      }
+    });
+
+    bot.command('subscription', async (ctx: Context) => {
+      try {
+        await this.subscriptionCommand.showMySubscription(ctx);
+      } catch (error: any) {
+        this.logger.error(`Error in /subscription: ${error.message}`);
+      }
+    });
+
+    // Обработчики платежей
+    bot.on('pre_checkout_query', async (ctx: Context) => {
+      try {
+        await this.subscriptionCommand.handlePreCheckout(ctx);
+      } catch (error: any) {
+        this.logger.error(`Error in pre_checkout_query: ${error.message}`);
+      }
+    });
+
+    bot.on('successful_payment', async (ctx: Context) => {
+      try {
+        await this.subscriptionCommand.handleSuccessfulPayment(ctx);
+      } catch (error: any) {
+        this.logger.error(`Error in successful_payment: ${error.message}`);
+      }
+    });
+
+    // Callback queries для кнопок
+    bot.on('callback_query', async (ctx: Context) => {
+      try {
+        await this.onCallbackQuery(ctx);
+      } catch (error: any) {
+        this.logger.error(`Error in callback_query: ${error.message}`);
+      }
+    });
+
+    // Остальные команды
     bot.command('ping', async (ctx: Context) => {
       try {
         await this.onPing(ctx);
@@ -70,6 +120,7 @@ export class TelegramUpdate implements OnModuleInit {
       }
     });
 
+    // Медиа обработчики
     bot.on('photo', async (ctx: Context) => {
       try {
         await this.onPhoto(ctx);
@@ -110,7 +161,7 @@ export class TelegramUpdate implements OnModuleInit {
       }
     });
 
-    this.logger.log('✅ Telegram command handlers registered');
+    this.logger.log('✅ Telegram command handlers registered (with payments)');
   }
 
   async onStart(ctx: Context) {
@@ -135,17 +186,126 @@ export class TelegramUpdate implements OnModuleInit {
         return;
       }
 
-      await ctx.reply(
-        `👤 Ваш профиль:\n\n` +
-        `ID: ${user.telegram_id}\n` +
-        `Username: @${user.username || 'не указан'}\n` +
-        `Имя: ${user.first_name}\n` +
-        `Последний визит: ${new Date(user.last_seen).toLocaleString('ru-RU')}`
-      );
+      // Получаем информацию о подписке
+      const plan = await this.subscriptionService.getCurrentPlan(ctx.from.id);
+      const subscription = await this.subscriptionService.getUserSubscription(ctx.from.id);
+
+      let profileText = `👤 **Ваш профиль**\n\n`;
+      profileText += `ID: ${user.telegram_id}\n`;
+      profileText += `Username: @${user.username || 'не указан'}\n`;
+      profileText += `Имя: ${user.first_name}\n`;
+      profileText += `Последний визит: ${new Date(user.last_seen).toLocaleString('ru-RU')}\n\n`;
+      
+      profileText += `💎 **Подписка:** ${plan.name}\n`;
+      
+      if (subscription && subscription.isActive) {
+        const daysLeft = Math.ceil(
+          (subscription.endDate.getTime() - new Date().getTime()) / (1000 * 60 * 60 * 24)
+        );
+        profileText += `⏰ Осталось: ${daysLeft} дней\n`;
+      }
+
+      await ctx.reply(profileText, { 
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: '⭐ Управление подпиской',
+                callback_data: 'show_subscription',
+              },
+            ],
+          ],
+        },
+      });
     } catch (error: any) {
       this.logger.error(`Error in profile command: ${error.message}`);
       await ctx.reply('Произошла ошибка при получении профиля.');
     }
+  }
+
+  /**
+   * Обработчик callback queries (нажатия на кнопки)
+   */
+  async onCallbackQuery(ctx: Context) {
+    if (!ctx.callbackQuery || !('data' in ctx.callbackQuery)) {
+      return;
+    }
+
+    const data = ctx.callbackQuery.data;
+
+    try {
+      // Простые строковые команды
+      if (data === 'show_plans') {
+        await ctx.answerCbQuery();
+        await this.subscriptionCommand.showPlans(ctx);
+        return;
+      }
+
+      if (data === 'show_subscription') {
+        await ctx.answerCbQuery();
+        await this.subscriptionCommand.showMySubscription(ctx);
+        return;
+      }
+
+      // JSON команды для покупки подписки
+      const parsedData: PaymentCallbackData = JSON.parse(data);
+
+      if (parsedData.action === 'buy_subscription') {
+        await ctx.answerCbQuery();
+        await this.subscriptionCommand.createInvoice(ctx, parsedData.planId);
+        return;
+      }
+    } catch (error: any) {
+      this.logger.error(`Error handling callback query: ${error.message}`);
+      await ctx.answerCbQuery('Ошибка при обработке запроса');
+    }
+  }
+
+  /**
+   * Проверка лимитов перед использованием AI функций
+   */
+  private async checkAndRecordUsage(
+    ctx: Context,
+    action: 'dailyGenerations' | 'imageGenerations' | 'voiceAnalysis',
+  ): Promise<boolean> {
+    if (!ctx.from) {
+      return false;
+    }
+
+    const limitCheck = await this.subscriptionService.checkUsageLimit(
+      ctx.from.id,
+      action,
+    );
+
+    if (!limitCheck.allowed) {
+      const plan = await this.subscriptionService.getCurrentPlan(ctx.from.id);
+      
+      await ctx.reply(
+        `❌ Вы достигли лимита на сегодня!\n\n` +
+        `💎 Ваш план: ${plan.name}\n` +
+        `📊 Лимит: ${limitCheck.limit} в день\n` +
+        `⏰ Лимит обновится завтра\n\n` +
+        `⭐ Хотите больше? Улучшите подписку: /subscribe`,
+        {
+          parse_mode: 'Markdown',
+        }
+      );
+      return false;
+    }
+
+    // Записываем использование
+    await this.subscriptionService.recordUsage(ctx.from.id, action);
+
+    // Предупреждаем, если осталось мало
+    if (limitCheck.remaining <= 3 && limitCheck.remaining > 0) {
+      await ctx.reply(
+        `⚠️ Внимание: осталось ${limitCheck.remaining} генераций на сегодня`,
+        { parse_mode: 'Markdown' }
+      );
+    }
+
+    return true;
   }
 
   async onPing(ctx: Context) {
@@ -155,7 +315,6 @@ export class TelegramUpdate implements OnModuleInit {
       const sentMessage = await ctx.reply('🏓 Pinging...');
       const latency = Date.now() - startTime;
       
-      // Проверка на существование chat
       if (!ctx.chat) {
         await ctx.reply('❌ Не удалось определить чат');
         return;
@@ -223,7 +382,6 @@ export class TelegramUpdate implements OnModuleInit {
         `🤖 AI: Gemini 1.5 Flash + 2.5 Flash Image 🍌\n` +
         `⏰ Время: ${new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' })}`;
       
-      // Проверка на существование chat
       if (!ctx.chat) {
         await ctx.reply('❌ Не удалось определить чат');
         return;
@@ -246,31 +404,31 @@ export class TelegramUpdate implements OnModuleInit {
   }
 
   async onImagine(ctx: Context) {
-    // Проверка на существование message
     if (!ctx.message || !('text' in ctx.message)) {
       await ctx.reply('❌ Не удалось получить текст команды');
       return;
     }
 
-    const messageText = ctx.message.text;
-    const prompt = messageText.replace('/imagine', '').trim();
+    // Проверяем лимиты
+    const canUse = await this.checkAndRecordUsage(ctx, 'imageGenerations');
+    if (!canUse) {
+      return;
+    }
+
+    const startTime = Date.now();
+    const text = ctx.message.text;
+    const prompt = text.replace('/imagine', '').trim();
 
     if (!prompt) {
       await ctx.reply(
-        '🍌 *Nano Banana Image Generator*\n\n' +
-        'Используй команду так:\n' +
-        '`/imagine опиши что ты хочешь увидеть`\n\n' +
-        '*Примеры:*\n' +
-        '• `/imagine красивый закат над океаном с пальмами`\n' +
-        '• `/imagine футуристический город в стиле киберпанк`\n' +
-        '• `/imagine милый котёнок играет с клубком`\n\n' +
-        '💰 Стоимость: ~$0.039 за изображение',
+        '🍌 **Nano Banana - Генерация изображений**\n\n' +
+        'Использование: `/imagine [ваш промпт]`\n\n' +
+        'Пример: `/imagine кот в космосе`',
         { parse_mode: 'Markdown' }
       );
       return;
     }
 
-    const startTime = Date.now();
     const statusMessage = await ctx.reply('🍌 Генерирую изображение...');
 
     try {
@@ -290,7 +448,6 @@ export class TelegramUpdate implements OnModuleInit {
         }
       );
 
-      // Проверка на существование chat
       if (ctx.chat) {
         await ctx.telegram.deleteMessage(ctx.chat.id, statusMessage.message_id);
       }
@@ -299,7 +456,6 @@ export class TelegramUpdate implements OnModuleInit {
     } catch (error: any) {
       this.logger.error(`Error generating image: ${error.message}`);
       
-      // Проверка на существование chat
       if (ctx.chat) {
         await ctx.telegram.editMessageText(
           ctx.chat.id,
@@ -312,8 +468,13 @@ export class TelegramUpdate implements OnModuleInit {
   }
 
   async onPhoto(ctx: Context) {
-    // Проверка на существование message и photo
     if (!ctx.message || !('photo' in ctx.message)) {
+      return;
+    }
+
+    // Проверяем лимиты
+    const canUse = await this.checkAndRecordUsage(ctx, 'imageGenerations');
+    if (!canUse) {
       return;
     }
 
@@ -326,7 +487,6 @@ export class TelegramUpdate implements OnModuleInit {
     const caption = 'caption' in ctx.message ? ctx.message.caption : undefined;
 
     if (!caption) {
-      // Анализ изображения
       await ctx.reply('🖼️ Анализирую изображение...');
 
       try {
@@ -352,7 +512,6 @@ export class TelegramUpdate implements OnModuleInit {
         await ctx.reply('❌ Ошибка при анализе изображения');
       }
     } else {
-      // Редактирование изображения через Nano Banana
       const statusMessage = await ctx.reply('🍌 Редактирую изображение...');
 
       try {
@@ -375,7 +534,6 @@ export class TelegramUpdate implements OnModuleInit {
           }
         );
 
-        // Проверка на существование chat
         if (ctx.chat) {
           await ctx.telegram.deleteMessage(ctx.chat.id, statusMessage.message_id);
         }
@@ -384,7 +542,6 @@ export class TelegramUpdate implements OnModuleInit {
       } catch (error: any) {
         this.logger.error(`Error editing image: ${error.message}`);
         
-        // Проверка на существование chat
         if (ctx.chat) {
           await ctx.telegram.editMessageText(
             ctx.chat.id,
@@ -398,8 +555,13 @@ export class TelegramUpdate implements OnModuleInit {
   }
 
   async onVoice(ctx: Context) {
-    // Проверка на существование message и voice
     if (!ctx.message || !('voice' in ctx.message)) {
+      return;
+    }
+
+    // Проверяем лимиты
+    const canUse = await this.checkAndRecordUsage(ctx, 'voiceAnalysis');
+    if (!canUse) {
       return;
     }
 
@@ -430,8 +592,13 @@ export class TelegramUpdate implements OnModuleInit {
   }
 
   async onAudio(ctx: Context) {
-    // Проверка на существование message и audio
     if (!ctx.message || !('audio' in ctx.message)) {
+      return;
+    }
+
+    // Проверяем лимиты
+    const canUse = await this.checkAndRecordUsage(ctx, 'voiceAnalysis');
+    if (!canUse) {
       return;
     }
 
@@ -462,8 +629,13 @@ export class TelegramUpdate implements OnModuleInit {
   }
 
   async onVideo(ctx: Context) {
-    // Проверка на существование message и video
     if (!ctx.message || !('video' in ctx.message)) {
+      return;
+    }
+
+    // Проверяем лимиты
+    const canUse = await this.checkAndRecordUsage(ctx, 'dailyGenerations');
+    if (!canUse) {
       return;
     }
 
